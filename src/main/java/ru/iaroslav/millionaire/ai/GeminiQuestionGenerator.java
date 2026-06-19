@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
 import ru.iaroslav.millionaire.model.Question;
 
 import java.net.URI;
@@ -20,6 +21,7 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
     private static final String API_KEY_ENV = "GEMINI_API_KEY";
     private static final String MODEL_ENV = "GEMINI_MODEL";
     private static final URI BASE_URI = URI.create("https://generativelanguage.googleapis.com/v1beta/models/");
+    private static final int MAX_ATTEMPTS = 3;
 
     private final Gson gson = new Gson();
     private final HttpClient httpClient;
@@ -53,25 +55,37 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
             throw new IllegalStateException("Не задан GEMINI_API_KEY.");
         }
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(endpoint())
-                .timeout(Duration.ofSeconds(45))
-                .header("Content-Type", "application/json")
-                .header("x-goog-api-key", apiKey)
-                .POST(HttpRequest.BodyPublishers.ofString(buildRequestBody(level), StandardCharsets.UTF_8))
-                .build();
+        RuntimeException lastParseError = null;
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(endpoint())
+                    .timeout(Duration.ofSeconds(45))
+                    .header("Content-Type", "application/json")
+                    .header("x-goog-api-key", apiKey)
+                    .POST(HttpRequest.BodyPublishers.ofString(buildRequestBody(level), StandardCharsets.UTF_8))
+                    .build();
 
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IllegalStateException("Gemini API вернул HTTP " + response.statusCode() + ": " + response.body());
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new IllegalStateException("Gemini API вернул HTTP " + response.statusCode() + ": " + response.body());
+            }
+
+            try {
+                GeneratedQuestion generatedQuestion = parseGeneratedQuestion(response.body());
+                return generatedQuestion.toQuestion(level);
+            } catch (RuntimeException ex) {
+                lastParseError = ex;
+            }
         }
 
-        GeneratedQuestion generatedQuestion = parseGeneratedQuestion(response.body());
-        return generatedQuestion.toQuestion(level);
+        throw new IllegalStateException(
+                "Gemini несколько раз вернул некорректный JSON. Последняя ошибка: " + lastParseError.getMessage(),
+                lastParseError
+        );
     }
 
     private URI endpoint() {
-        return BASE_URI.resolve(model + ":generateContent");
+        return URI.create(BASE_URI + model + ":generateContent");
     }
 
     private String buildRequestBody(int level) {
@@ -94,17 +108,11 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
     }
 
     private JsonObject generationConfig() {
-        JsonObject textFormat = new JsonObject();
-        textFormat.addProperty("mimeType", "application/json");
-        textFormat.add("schema", responseSchema());
-
-        JsonObject responseFormat = new JsonObject();
-        responseFormat.add("text", textFormat);
-
         JsonObject generationConfig = new JsonObject();
-        generationConfig.addProperty("temperature", 0.8);
-        generationConfig.addProperty("maxOutputTokens", 700);
-        generationConfig.add("responseFormat", responseFormat);
+        generationConfig.addProperty("temperature", 0.5);
+        generationConfig.addProperty("maxOutputTokens", 1200);
+        generationConfig.addProperty("responseMimeType", "application/json");
+        generationConfig.add("responseSchema", responseSchema());
         return generationConfig;
     }
 
@@ -152,8 +160,9 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
                 - ровно 4 варианта ответа;
                 - только один вариант должен быть правильным;
                 - не используй неоднозначные, спорные и устаревшие факты;
-                - не добавляй пояснения, комментарии или markdown;
-                - верни JSON по схеме: text, answers, rightAnswer.
+                - не добавляй пояснения, комментарии, markdown или блоки кода;
+                - значения полей не должны содержать переносы строк;
+                - верни только один валидный JSON-объект по схеме: text, answers, rightAnswer.
                 """.formatted(level);
     }
 
@@ -165,6 +174,11 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
         }
 
         JsonObject candidate = candidates.get(0).getAsJsonObject();
+        String finishReason = candidate.has("finishReason") ? candidate.get("finishReason").getAsString() : "";
+        if ("MAX_TOKENS".equals(finishReason)) {
+            throw new IllegalStateException("Gemini обрезал JSON из-за лимита токенов.");
+        }
+
         JsonObject content = candidate.getAsJsonObject("content");
         JsonArray parts = content == null ? null : content.getAsJsonArray("parts");
         if (parts == null || parts.isEmpty()) {
@@ -172,7 +186,16 @@ public final class GeminiQuestionGenerator implements QuestionGenerator {
         }
 
         String json = parts.get(0).getAsJsonObject().get("text").getAsString();
-        return gson.fromJson(json, GeneratedQuestion.class).validate();
+        try {
+            return gson.fromJson(json, GeneratedQuestion.class).validate();
+        } catch (JsonSyntaxException ex) {
+            throw new IllegalStateException("Gemini вернул невалидный JSON: " + preview(json), ex);
+        }
+    }
+
+    private String preview(String value) {
+        String compact = value.replace('\n', ' ').replace('\r', ' ').trim();
+        return compact.length() > 220 ? compact.substring(0, 220) + "..." : compact;
     }
 
     private record GeneratedQuestion(String text, List<String> answers, int rightAnswer) {
